@@ -56,15 +56,18 @@ sdtv_mode=2
 
 ========================================
 
-/etc/systemd/system/tracker_hdmi.service
+# Створення сервісу
+sudo nano /etc/systemd/system/tracker_hdmi.service
+
+**************************************************
 
 [Unit]
 Description=HDMI Camera Tracker
 After=multi-user.target
 
 [Service]
-ExecStart=/usr/bin/python3 /home/yoghurt/tracker/tracker_hdmi.py
-WorkingDirectory=/home/yoghurt/tracker
+ExecStart=/usr/bin/python3 /home/yoghurt/Project/tracker_hdmi.py
+WorkingDirectory=/home/yoghurt/Project
 Restart=always
 RestartSec=2
 StandardOutput=journal
@@ -73,3 +76,26 @@ StandardError=journal
 [Install]
 WantedBy=multi-user.target
 
+**************************************************
+
+# Оновіть конфігурацію
+sudo systemctl daemon-reload
+
+# Запустіть сервіс
+sudo systemctl start tracker_hdmi
+
+# Додайте в автозавантаження
+sudo systemctl enable tracker_hdmi
+
+# Перезапуск сервісу
+sudo systemctl restart tracker_hdmi
+
+# Перевірка статусу
+systemctl status tracker_hdmi
+
+# Зупинка та вимкнення сервісу
+sudo systemctl stop tracker_hdmi
+sudo systemctl disable tracker_hdmi
+
+# Видалення файлів сервісу
+sudo rm /etc/systemd/system/tracker_hdmi.tracker_hdmi
