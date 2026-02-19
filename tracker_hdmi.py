@@ -4,16 +4,12 @@ import threading
 import numpy as np
 import cv2
 import serial
-import RPi.GPIO as GPIO
 from picamera2 import Picamera2
 from collections import deque
 
 # ================= CONFIG =================
 MSP_PORT = "/dev/serial0"
 MSP_BAUD = 115200
-
-PIN_CAPTURE = 17
-PIN_ATTACK  = 18
 
 CAM_RES = (320, 240)
 FPS = 30
@@ -25,17 +21,14 @@ RECORD_SECONDS = 3
 RC_RATE = 50
 MSP_INTERVAL = 1 / RC_RATE
 
+# ===== TARGET CONTROL =====
+target_state = "IDLE"   # IDLE / LOCKED / TRACK
+tracker = None
+cross_x = CAM_RES[0] // 2
+cross_y = CAM_RES[1] // 2
+
 # ==========================================
-
-GPIO.setmode(GPIO.BCM)
-GPIO.setup(PIN_CAPTURE, GPIO.IN, pull_up_down=GPIO.PUD_DOWN)
-GPIO.setup(PIN_ATTACK,  GPIO.IN, pull_up_down=GPIO.PUD_DOWN)
-
-tracking_active = False
-attack_active   = False
-
 rc_buffer = deque(maxlen=RC_RATE * RECORD_SECONDS)
-recorded_pattern = []
 
 # ================= MSP ====================
 def msp_send(ser, cmd, payload=b''):
@@ -53,97 +46,177 @@ def send_rc_override(ser, rc):
 
 # ================= RC MONITOR =============
 def rc_monitor():
-    ser = serial.Serial(MSP_PORT, MSP_BAUD, timeout=0.01)
+    import struct
+    ser = serial.Serial(MSP_PORT, MSP_BAUD, timeout=0.05)
+
+    def msp_request_rc():
+        cmd = 105
+        ser.write(b'$M<' + bytes([0, cmd, cmd]))
+
+    def msp_receive_rc():
+        if ser.in_waiting == 0:
+            return None
+        data = ser.read(ser.in_waiting)
+        idx = data.find(b"$M>")
+        if idx == -1:
+            return None
+
+        size = data[idx+3]
+        payload = data[idx+5: idx+5+size]
+
+        if len(payload) < 24:
+            return None
+
+        chans = struct.unpack('<12H', payload[:24])
+        return list(chans)
+
     while True:
-        # Тут встав свій MSP_RC read (105)
-        rc = [1500,1500,1500,1500]
-        rc_buffer.append(rc)
-        time.sleep(1/RC_RATE)
+        try:
+            msp_request_rc()
+            time.sleep(0.01)
+            rc = msp_receive_rc()
+            if rc:
+                rc_buffer.append(rc)
+        except Exception as e:
+            print("RC monitor error:", e)
 
-# ================= GPIO ===================
-def gpio_monitor():
-    global tracking_active, attack_active, recorded_pattern
-
-    prev_capture = 0
-    prev_attack  = 0
-
-    while True:
-        cap = GPIO.input(PIN_CAPTURE)
-        atk = GPIO.input(PIN_ATTACK)
-
-        # --- CAPTURE ---
-        if cap and not prev_capture:
-            tracking_active = True
-            recorded_pattern = list(rc_buffer)
-            print(f"Захоплено. Записано {len(recorded_pattern)} RC")
-
-        if not cap and prev_capture:
-            tracking_active = False
-            print("Трекінг OFF")
-
-        # --- ATTACK ---
-        if atk and not prev_attack:
-            attack_active = True
-            print("ATTACK ON")
-
-        if not atk and prev_attack:
-            attack_active = False
-            print("ATTACK OFF")
-
-        prev_capture = cap
-        prev_attack  = atk
-        time.sleep(0.01)
+        time.sleep(MSP_INTERVAL)
 
 # ================= TRACKER =================
 def tracking_loop(picam2):
-    global tracking_active, attack_active, recorded_pattern
+    global tracker, target_state, cross_x, cross_y
 
-    tracker = None
     ser = serial.Serial(MSP_PORT, MSP_BAUD, timeout=0.01)
-    pattern_index = 0
     last_msp = 0
+    
+    lost_frames = 0
+    MAX_LOST = 8
 
     while True:
 
         frame = picam2.capture_array("main")
+        frame = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
 
-        if tracking_active and tracker is None:
-            bbox = (
-                CAM_RES[0]//2 - 40,
-                CAM_RES[1]//2 - 40,
-                80, 80
-            )
-            tracker = cv2.legacy.TrackerMOSSE_create()
-            tracker.init(frame, bbox)
+        if not rc_buffer:
+            continue
 
-        if not tracking_active:
+        rc = rc_buffer[-1]
+        mode_ch9 = rc[8]
+
+        # ================= STATE MACHINE =================
+
+        # ----- RESET -----
+        if mode_ch9 < 1300:
+            if target_state != "IDLE":
+                print("RESET")
+
+            target_state = "IDLE"
             tracker = None
+            cross_x = CAM_RES[0] // 2
+            cross_y = CAM_RES[1] // 2
 
-        if tracker:
+        # ----- LOCK -----
+        elif 1300 <= mode_ch9 <= 1700:
+            if target_state == "IDLE":
+
+                box_size = 35
+                bbox = (
+                    CAM_RES[0]//2 - box_size//2,
+                    CAM_RES[1]//2 - box_size//2,
+                    box_size,
+                    box_size
+                )
+
+                if hasattr(cv2, "legacy"):
+                    tracker = cv2.legacy.TrackerCSRT_create()
+                else:
+                    tracker = cv2.TrackerCSRT_create()
+                ok = tracker.init(frame, bbox)
+
+                if ok:
+                    target_state = "LOCKED"
+                    lost_frames = 0
+                    print("TARGET LOCKED")
+                else:
+                    print("TRACKER INIT FAILED")
+                    tracker = None
+
+        # ----- TRACK -----
+        elif mode_ch9 > 1700:
+            if tracker is not None:
+                target_state = "TRACK"
+
+        # ================= TRACKING =================
+
+        overlay = np.zeros((CAM_RES[1], CAM_RES[0], 4), dtype=np.uint8)
+
+        if target_state in ["LOCKED", "TRACK"] and tracker is not None:
+
             ok, bbox = tracker.update(frame)
+
             if ok:
-                x,y,w,h = [int(v) for v in bbox]
-                cx = x + w//2
-                cy = y + h//2
+                lost_frames = 0
 
-                err_x = cx - CAM_RES[0]//2
-                err_y = cy - CAM_RES[1]//2
+                x, y, w, h = [int(v) for v in bbox]
 
-                if attack_active and recorded_pattern:
-                    base = recorded_pattern[pattern_index % len(recorded_pattern)]
-                    pattern_index += 1
+                target_x = x + w // 2
+                target_y = y + h // 2
 
-                    rc = base[:]
-                    rc[1] = int(base[1] - err_y * GAIN_PITCH)
-                    rc[2] = int(base[2] + err_x * GAIN_YAW)
+                alpha = 0.6
+                cross_x = int(alpha * target_x + (1 - alpha) * cross_x)
+                cross_y = int(alpha * target_y + (1 - alpha) * cross_y)
 
-                    rc = [max(1000,min(2000,v)) for v in rc]
+                cv2.rectangle(
+                    overlay,
+                    (x, y),
+                    (x + w, y + h),
+                    (255, 0, 0, 255),   # червоний стабільний
+                    2
+                )
+
+                if target_state == "TRACK":
+
+                    err_x = cross_x - CAM_RES[0]//2
+                    err_y = cross_y - CAM_RES[1]//2
+
+                    rc_out = rc[:]
+                    rc_out[1] = int(rc[1] - err_y * GAIN_PITCH)
+                    rc_out[2] = int(rc[2] + err_x * GAIN_YAW)
+
+                    rc_out = [max(1000, min(2000, v)) for v in rc_out]
 
                     if time.time() - last_msp > MSP_INTERVAL:
-                        send_rc_override(ser, rc)
+                        send_rc_override(ser, rc_out)
                         last_msp = time.time()
 
-        time.sleep(0.005)
+            else:
+                lost_frames += 1
+
+                if lost_frames > MAX_LOST:
+                    print("TARGET LOST")
+                    target_state = "IDLE"
+                    tracker = None
+                    lost_frames = 0
+
+
+        # ================= DRAW CROSSHAIR =================
+
+        # ================= DRAW CROSSHAIR =================
+
+        # Показуємо хрестик ТІЛЬКИ коли немає захоплення
+        if target_state == "IDLE":
+            cv2.drawMarker(
+                overlay,
+                (CAM_RES[0]//2, CAM_RES[1]//2),
+                (0, 255, 0, 255),   # зелений
+                cv2.MARKER_CROSS,
+                20,
+                2
+            )
+
+        picam2.set_overlay(overlay)
+        
+        time.sleep(0.01)
 
 # ================= CROSSHAIR ==============
 def create_crosshair(size):
@@ -190,7 +263,6 @@ if __name__ == "__main__":
     picam2.set_overlay(overlay)
 
     threading.Thread(target=rc_monitor, daemon=True).start()
-    threading.Thread(target=gpio_monitor, daemon=True).start()
     threading.Thread(target=tracking_loop, args=(picam2,), daemon=True).start()
 
     print("SYSTEM READY")
@@ -199,5 +271,4 @@ if __name__ == "__main__":
         while True:
             time.sleep(1)
     except KeyboardInterrupt:
-        GPIO.cleanup()
         picam2.stop()

@@ -1,107 +1,102 @@
 #!/usr/bin/env python3
+import serial
+import struct
 import time
-import pigpio
-import numpy as np
-from picamera2 import Picamera2
-from picamera2.previews import DrmPreview
 
-# ========= CAMERA ==========
-W, H = 640, 480
-CX, CY = W // 2, H // 2
+PORT = "/dev/ttyAMA0"
+BAUD = 115200
+MSP_RC = 105
 
-# ========= SERVO ===========
-PAN_GPIO  = 18
-TILT_GPIO = 13
+ser = serial.Serial(PORT, BAUD, timeout=0.05)
 
-PAN_MIN, PAN_MAX   = 1000, 2000
-TILT_MIN, TILT_MAX = 1000, 2000
+rx_buffer = bytearray()
 
-pan  = 1500
-tilt = 1500
+def send_msp(cmd):
+    size = 0
+    crc = size ^ cmd
+    packet = b"$M<" + bytes([size, cmd, crc])
+    ser.write(packet)
 
-# ========= PID =============
-KP = 1.2
-KD = 0.35
-DEAD = 6
-MAX_STEP = 10
+def parse_msp():
+    global rx_buffer
 
-# ========= MOTION ==========
-THRESH   = 20
-MIN_PIX  = 1500
-ALPHA    = 0.96
+    while True:
+        if len(rx_buffer) < 6:
+            return None
 
-# ===========================
-pi = pigpio.pi()
-assert pi.connected, "pigpio not running"
+        start = rx_buffer.find(b"$M>")
+        if start == -1:
+            rx_buffer.clear()
+            return None
 
-pi.set_mode(PAN_GPIO, pigpio.OUTPUT)
-pi.set_mode(TILT_GPIO, pigpio.OUTPUT)
+        if start > 0:
+            rx_buffer = rx_buffer[start:]
 
-pi.set_servo_pulsewidth(PAN_GPIO, pan)
-pi.set_servo_pulsewidth(TILT_GPIO, tilt)
+        if len(rx_buffer) < 6:
+            return None
 
-bg = None
-ex_prev = ey_prev = 0
+        size = rx_buffer[3]
+        cmd = rx_buffer[4]
 
-def post_callback(req):
-    global bg, pan, tilt, ex_prev, ey_prev
+        if len(rx_buffer) < 6 + size:
+            return None
 
-    # ✅ Y channel already 2D
-    y = req.make_array("main")
+        payload = rx_buffer[5:5+size]
+        checksum = rx_buffer[5+size]
 
-    if bg is None:
-        bg = y.astype(np.float32)
-        return
+        calc_crc = size ^ cmd
+        for b in payload:
+            calc_crc ^= b
 
-    bg[:] = ALPHA * bg + (1 - ALPHA) * y
+        if calc_crc == checksum:
+            rx_buffer = rx_buffer[6+size:]
+            return cmd, payload
+        else:
+            print("❌ CRC ERROR")
+            rx_buffer = rx_buffer[1:]
 
-    diff = np.abs(y.astype(np.int16) - bg.astype(np.int16))
-    mask = diff > THRESH
+print("=== MSP RC DEBUG STARTED ===")
 
-    ys, xs = np.where(mask)
-    if len(xs) < MIN_PIX:
-        return
-
-    cx = int(xs.mean())
-    cy = int(ys.mean())
-
-    ex = cx - CX
-    ey = cy - CY
-
-    if abs(ex) < DEAD: ex = 0
-    if abs(ey) < DEAD: ey = 0
-
-    dx = KP * ex + KD * (ex - ex_prev)
-    dy = KP * ey + KD * (ey - ey_prev)
-
-    ex_prev, ey_prev = ex, ey
-
-    dx = np.clip(dx, -MAX_STEP, MAX_STEP)
-    dy = np.clip(dy, -MAX_STEP, MAX_STEP)
-
-    pan  -= dx
-    tilt += dy
-
-    pan  = int(np.clip(pan,  PAN_MIN,  PAN_MAX))
-    tilt = int(np.clip(tilt, TILT_MIN, TILT_MAX))
-
-    pi.set_servo_pulsewidth(PAN_GPIO, pan)
-    pi.set_servo_pulsewidth(TILT_GPIO, tilt)
-
-# ========= START ===========
-picam2 = Picamera2()
-cfg = picam2.create_preview_configuration(
-    main={"format": "YUV420", "size": (W, H)}
-)
-picam2.configure(cfg)
-
-preview = DrmPreview()
-picam2.start_preview(preview)
-
-picam2.post_callback = post_callback
-picam2.start()
-
-print("⚡ FAST PID TRACKER RUNNING (NO OVERLAY)")
+last_channels = None
 
 while True:
-    time.sleep(1)
+    try:
+        send_msp(MSP_RC)
+        time.sleep(0.01)
+
+        if ser.in_waiting:
+            rx_buffer.extend(ser.read(ser.in_waiting))
+
+        result = parse_msp()
+
+        if result:
+            cmd, payload = result
+
+            if cmd == MSP_RC:
+                print("\n--- PACKET RECEIVED ---")
+                print("RAW:", payload.hex())
+
+                if len(payload) >= 24:  # 12 каналів
+                    channels = struct.unpack("<12H", payload[:24])
+                else:
+                    channels = struct.unpack("<8H", payload[:16])
+
+                print("CHANNELS:", channels)
+
+                if last_channels:
+                    diffs = [
+                        channels[i] - last_channels[i]
+                        for i in range(len(channels))
+                    ]
+                    print("DELTA:", diffs)
+
+                last_channels = channels
+
+        time.sleep(0.05)
+
+    except KeyboardInterrupt:
+        print("\nStopped.")
+        break
+
+    except Exception as e:
+        print("ERROR:", e)
