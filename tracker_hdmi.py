@@ -27,6 +27,8 @@ tracker = None
 cross_x = CAM_RES[0] // 2
 cross_y = CAM_RES[1] // 2
 
+locked_rc = None
+
 # ==========================================
 rc_buffer = deque(maxlen=RC_RATE * RECORD_SECONDS)
 
@@ -42,6 +44,7 @@ def msp_send(ser, cmd, payload=b''):
 def send_rc_override(ser, rc):
     rc = rc + [1500]*(8-len(rc))
     payload = b''.join(bytes([v & 0xFF, v>>8]) for v in rc)
+    print("MSP OUT:", rc[:4])   # DEBUG
     msp_send(ser, 200, payload)
 
 # ================= RC MONITOR =============
@@ -84,11 +87,25 @@ def rc_monitor():
 
 # ================= TRACKER =================
 def tracking_loop(picam2):
-    global tracker, target_state, cross_x, cross_y
+    global tracker, target_state, cross_x, cross_y, locked_rc
 
     ser = serial.Serial(MSP_PORT, MSP_BAUD, timeout=0.01)
     last_msp = 0
-    
+
+    # ===== PID CONFIG =====
+    KP = 0.45
+    KI = 0.02
+    KD = 0.18
+
+    DEADBAND = 12
+    MAX_RATE = 180      # максимум відхилення RC
+    I_LIMIT = 300
+
+    integral_x = 0
+    integral_y = 0
+    prev_err_x = 0
+    prev_err_y = 0
+
     lost_frames = 0
     MAX_LOST = 8
 
@@ -105,17 +122,19 @@ def tracking_loop(picam2):
 
         # ================= STATE MACHINE =================
 
-        # ----- RESET -----
         if mode_ch9 < 1300:
             if target_state != "IDLE":
                 print("RESET")
 
             target_state = "IDLE"
             tracker = None
+            locked_rc = None
             cross_x = CAM_RES[0] // 2
             cross_y = CAM_RES[1] // 2
 
-        # ----- LOCK -----
+            integral_x = 0
+            integral_y = 0
+
         elif 1300 <= mode_ch9 <= 1700:
             if target_state == "IDLE":
 
@@ -131,17 +150,18 @@ def tracking_loop(picam2):
                     tracker = cv2.legacy.TrackerCSRT_create()
                 else:
                     tracker = cv2.TrackerCSRT_create()
+
                 ok = tracker.init(frame, bbox)
 
                 if ok:
                     target_state = "LOCKED"
+                    locked_rc = rc[:]
                     lost_frames = 0
                     print("TARGET LOCKED")
                 else:
                     print("TRACKER INIT FAILED")
                     tracker = None
 
-        # ----- TRACK -----
         elif mode_ch9 > 1700:
             if tracker is not None:
                 target_state = "TRACK"
@@ -162,6 +182,7 @@ def tracking_loop(picam2):
                 target_x = x + w // 2
                 target_y = y + h // 2
 
+                # ===== smoothing =====
                 alpha = 0.6
                 cross_x = int(alpha * target_x + (1 - alpha) * cross_x)
                 cross_y = int(alpha * target_y + (1 - alpha) * cross_y)
@@ -170,36 +191,85 @@ def tracking_loop(picam2):
                     overlay,
                     (x, y),
                     (x + w, y + h),
-                    (255, 0, 0, 255),   # червоний стабільний
+                    (255, 0, 0, 255),
                     2
                 )
 
                 if target_state == "TRACK":
 
+                    # ===== ERROR =====
                     err_x = cross_x - CAM_RES[0]//2
                     err_y = cross_y - CAM_RES[1]//2
 
-                    rc_out = rc[:]
-                    rc_out[1] = int(rc[1] - err_y * GAIN_PITCH)
-                    rc_out[2] = int(rc[2] + err_x * GAIN_YAW)
+                    # ===== DEAD BAND =====
+                    if abs(err_x) < DEADBAND:
+                        err_x = 0
+                    if abs(err_y) < DEADBAND:
+                        err_y = 0
 
-                    rc_out = [max(1000, min(2000, v)) for v in rc_out]
+                    dt = MSP_INTERVAL
 
-                    if time.time() - last_msp > MSP_INTERVAL:
-                        send_rc_override(ser, rc_out)
-                        last_msp = time.time()
+                    # ===== PID =====
+                    integral_x += err_x * dt
+                    integral_y += err_y * dt
+
+                    # anti-windup
+                    integral_x = max(-I_LIMIT, min(I_LIMIT, integral_x))
+                    integral_y = max(-I_LIMIT, min(I_LIMIT, integral_y))
+
+                    derivative_x = (err_x - prev_err_x) / dt
+                    derivative_y = (err_y - prev_err_y) / dt
+
+                    output_yaw = KP*err_x + KI*integral_x + KD*derivative_x
+                    output_pitch = KP*err_y + KI*integral_y + KD*derivative_y
+
+                    prev_err_x = err_x
+                    prev_err_y = err_y
+
+                    # ===== RATE LIMIT =====
+                    output_yaw = max(-MAX_RATE, min(MAX_RATE, output_yaw))
+                    output_pitch = max(-MAX_RATE, min(MAX_RATE, output_pitch))
+
+                    # ================= AUTO CONTROL FROM LOCKED RC =================
+                    if locked_rc is not None:
+
+                        rc_out = locked_rc[:]   # база = зафіксовані стики
+
+                        # додаємо PID
+                        rc_out[1] = int(locked_rc[1] - output_pitch)  # Pitch
+                        rc_out[2] = int(locked_rc[2] + output_yaw)    # Yaw
+
+                        # обмеження автокорекції
+                        rc_out[1] = max(1400, min(1600, rc_out[1]))
+                        rc_out[2] = max(1400, min(1600, rc_out[2]))
+
+                        if time.time() - last_msp > MSP_INTERVAL:
+                            send_rc_override(ser, rc_out)
+                            last_msp = time.time()
 
             else:
                 lost_frames += 1
 
                 if lost_frames > MAX_LOST:
-                    print("TARGET LOST")
+                    print("TARGET LOST CONFIRMED")
                     target_state = "IDLE"
                     tracker = None
                     lost_frames = 0
 
+        # ===== CROSSHAIR (IDLE only) =====
+        if target_state == "IDLE":
+            cv2.drawMarker(
+                overlay,
+                (CAM_RES[0]//2, CAM_RES[1]//2),
+                (0, 255, 0, 255),
+                cv2.MARKER_CROSS,
+                20,
+                2
+            )
 
-        # ================= DRAW CROSSHAIR =================
+        picam2.set_overlay(overlay)
+
+        time.sleep(0.01)
 
         # ================= DRAW CROSSHAIR =================
 
@@ -213,10 +283,6 @@ def tracking_loop(picam2):
                 20,
                 2
             )
-
-        picam2.set_overlay(overlay)
-        
-        time.sleep(0.01)
 
 # ================= CROSSHAIR ==============
 def create_crosshair(size):
